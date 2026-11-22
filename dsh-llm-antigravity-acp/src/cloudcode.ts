@@ -839,6 +839,53 @@ async function postWithFallback(
 }
 
 /**
+ * Raised when Cloud Code PA answers 403 `VALIDATION_REQUIRED`: Google wants the
+ * account owner to confirm the account in a browser before it serves again.
+ */
+export class VerificationRequiredError extends Error {
+  readonly code = 'VALIDATION_REQUIRED'
+  /**
+   * @param message - upstream message, e.g. "Verify your account to continue."
+   * @param verificationUrl - browser link that clears the check, when upstream gave one.
+   */
+  constructor(message: string, readonly verificationUrl?: string) {
+    super(message)
+    this.name = 'VerificationRequiredError'
+  }
+}
+
+/**
+ * Read a Cloud Code 403 body for Google's account-verification demand.
+ * @param body - parsed JSON body or raw text.
+ * @returns the message and link, or undefined when the body is not a verification demand.
+ */
+export function parseVerificationRequired(body: unknown): { message: string, verificationUrl?: string } | undefined {
+  let data: unknown = body
+  if (typeof data === 'string') {
+    try {
+      data = JSON.parse(data)
+    } catch {
+      if (!/VALIDATION_REQUIRED|verify your account/i.test(data)) return undefined
+      const link = /https:\/\/accounts\.google\.com\/[^\s"'<>\\]+/.exec(data)
+      return { message: 'Verify your account to continue.', ...(link ? { verificationUrl: link[0] } : {}) }
+    }
+  }
+  const record = data !== null && typeof data === 'object' ? data as Record<string, unknown> : undefined
+  const error = (record?.error ?? record) as { message?: unknown, details?: unknown } | undefined
+  const details = Array.isArray(error?.details) ? error.details as Array<Record<string, any>> : []
+  const info = details.find(d => d !== null && typeof d === 'object' && d.reason === 'VALIDATION_REQUIRED')
+  const helpUrl = details
+    .flatMap(d => (Array.isArray(d?.links) ? d.links as Array<{ url?: unknown }> : []))
+    .map(l => l?.url)
+    .find((u): u is string => typeof u === 'string' && /^https:\/\/accounts\.google\.com\//.test(u))
+  if (info === undefined && !/verify your account/i.test(String(error?.message ?? ''))) return undefined
+  const validationUrl: unknown = info?.metadata?.validation_url
+  const url = typeof validationUrl === 'string' && /^https:\/\//.test(validationUrl) ? validationUrl : helpUrl
+  const message = String(info?.metadata?.validation_error_message ?? error?.message ?? 'Verify your account to continue.')
+  return { message, ...(url !== undefined ? { verificationUrl: url } : {}) }
+}
+
+/**
  * Inspect one Antigravity account directly against Cloud Code PA (`loadCodeAssist`,
  * `retrieveUserQuotaSummary`, `fetchAvailableModels`).
  * @param options - account layout, environment, command runner, and optional transport override.
@@ -902,6 +949,15 @@ export async function inspectCloudCodeAccount(options: {
     postWithFallback('/v1internal:retrieveUserQuotaSummary', accessToken, projectPayload, transport, options.env),
     postWithFallback('/v1internal:fetchAvailableModels', accessToken, projectPayload, transport, options.env),
   ])
+
+  // A verification demand shows up on `retrieveUserQuotaSummary` (and sometimes
+  // `loadCodeAssist`) while `fetchAvailableModels` still answers 200, so check
+  // every 403 before deciding the account is fine.
+  for (const res of [loadRes, summaryRes, modelsRes]) {
+    if (res.status !== 403) continue
+    const verification = parseVerificationRequired(res.body)
+    if (verification !== undefined) throw new VerificationRequiredError(verification.message, verification.verificationUrl)
+  }
 
   if (modelsRes.status === 403) {
     throw new Error(`Account forbidden (HTTP 403): ${typeof modelsRes.body === 'string' ? modelsRes.body : JSON.stringify(modelsRes.body)}`)

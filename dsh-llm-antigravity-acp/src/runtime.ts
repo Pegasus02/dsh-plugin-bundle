@@ -573,6 +573,7 @@ export class AntigravityRuntime implements AccountAdmin {
       slot.email = email
       if (email !== undefined && email.length > 0) {
         const snap = await this.quota.readFor(slot.layout.id, slot.env, false, slot.layout).catch(() => undefined)
+        if (snap !== undefined) noteVerification(slot, snap)
         if (snap !== undefined && snap.status === 'ok') {
           this.applyQuotaToSlot(slot, snap)
         }
@@ -666,6 +667,7 @@ export class AntigravityRuntime implements AccountAdmin {
     if (slot === undefined) return this.quota.read(force)
     if (!slot.layout.system && process.platform === 'darwin') await unlockAccountKeychain(slot.layout, this.host.runCommand)
     const snapshot = await this.quota.readFor(id, slot.env, force, slot.layout)
+    noteVerification(slot, snapshot)
     if (snapshot.status === 'ok') this.applyQuotaToSlot(slot, snapshot)
     return snapshot
   }
@@ -829,6 +831,11 @@ export class AntigravityRuntime implements AccountAdmin {
         cooldowns: this.pool.cooldowns(layout.id),
         sessions: sessions.get(layout.id) ?? 0,
         email: slot?.email ?? undefined,
+        ...(slot?.verification !== undefined ? {
+          verificationRequired: true,
+          ...(slot.verification.url !== undefined ? { verificationUrl: slot.verification.url } : {}),
+          verificationMessage: slot.verification.message,
+        } : {}),
         ...(slot?.subscriptionTier !== undefined ? { subscriptionTier: slot.subscriptionTier } : {}),
         ...(slot?.subscriptionName !== undefined ? { subscriptionName: slot.subscriptionName } : {}),
         availableModels: accountAvailable,
@@ -1082,6 +1089,14 @@ export class AntigravityRuntime implements AccountAdmin {
           // request instead of upstream quota: they must never cool an account
           // down, park one, or fail the step over to another account.
           if (isReanswerFailure(error)) throw error
+          if (isVerificationFailure(error)) {
+            const message = error instanceof Error ? error.message : String(error)
+            slot.verification = { message, url: slot.verification?.url, at: Date.now() }
+            // The prompt error carries no link; Cloud Code's 403 does.
+            void this.quotaFor(layout.id, true).catch(() => undefined)
+            this.host.log.warn(`antigravity-acp: account "${layout.id}" needs Google account verification (${message})`)
+            throw mapError(error)
+          }
           const code = failureCode(error)
           if (code === 'RATE_LIMIT') {
             // Upstream overload, not an exhausted window: cool the account for
@@ -2741,6 +2756,34 @@ function turnSettled(turn: AcpTurn, timeoutMs: number): Promise<void> {
 }
 
 /**
+ * Whether a failure is Google's account-verification demand (403 VALIDATION_REQUIRED).
+ * @param error - the failure.
+ * @returns true when the account owner must verify the account in a browser.
+ */
+function isVerificationFailure(error: unknown): boolean {
+  if ((error as { code?: unknown } | undefined)?.code === 'VALIDATION_REQUIRED') return true
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return /VALIDATION_REQUIRED|verify your account/i.test(message)
+}
+
+/**
+ * Record or clear one account's pending verification from a quota snapshot.
+ * @param slot - account slot.
+ * @param snapshot - quota snapshot just read for it.
+ */
+function noteVerification(slot: AccountSlot, snapshot: QuotaSnapshot): void {
+  if (snapshot.verificationRequired === true) {
+    slot.verification = {
+      message: snapshot.error ?? 'Verify your account to continue.',
+      url: snapshot.verificationUrl ?? slot.verification?.url,
+      at: Date.now(),
+    }
+  } else if (snapshot.status === 'ok') {
+    slot.verification = undefined
+  }
+}
+
+/**
  * Map transport and agent failures onto stable DSH failure codes.
  * @param error - the failure.
  * @returns an LlmError.
@@ -2749,6 +2792,9 @@ export function mapError(error: unknown): Error {
   if (error instanceof LlmError) return error
   const message = error instanceof Error ? error.message : String(error)
   if (error instanceof JsonRpcClosedError) return new LlmError(labeled('TRANSPORT', `Antigravity ACP link closed: ${message}`), 'TRANSPORT', { cause: error })
+  if (/VALIDATION_REQUIRED|verify your account/i.test(message)) {
+    return new LlmError(`${message} Open Settings → Antigravity and use "Verify" on the account card to finish Google account verification.`, 'AUTH', { cause: error })
+  }
   if (/authentication required|not logged in|unauthenticated|sign in/i.test(message)) {
     return new LlmError(labeled('AUTH', message), 'AUTH', { cause: error })
   }

@@ -731,15 +731,38 @@ async function postWithFallback(path, accessToken, payload, transport, env) {
  * account owner to confirm the account in a browser before it serves again.
  */
 export class VerificationRequiredError extends Error {
+    verificationUrl;
+    code = 'VALIDATION_REQUIRED';
     /**
      * @param message - upstream message, e.g. "Verify your account to continue."
      * @param verificationUrl - browser link that clears the check, when upstream gave one.
      */
     constructor(message, verificationUrl) {
         super(message);
-        this.name = 'VerificationRequiredError';
-        this.code = 'VALIDATION_REQUIRED';
         this.verificationUrl = verificationUrl;
+        this.name = 'VerificationRequiredError';
+    }
+}
+/**
+ * Validate that an upstream verification link is an HTTPS Google URL.
+ * @param value - candidate URL string.
+ * @param options.excludeSupport - omit `support.google.com` help pages so a Learn-More link never shadows the verification URL.
+ * @returns true when the URL is safe to expose on the account card.
+ */
+function isAllowedVerificationUrl(value, options) {
+    if (typeof value !== 'string')
+        return false;
+    try {
+        const parsed = new URL(value);
+        if (parsed.protocol !== 'https:')
+            return false;
+        const host = parsed.hostname.toLowerCase();
+        if (options?.excludeSupport === true && host === 'support.google.com')
+            return false;
+        return host === 'google.com' || host.endsWith('.google.com');
+    }
+    catch {
+        return false;
     }
 }
 /**
@@ -749,30 +772,33 @@ export class VerificationRequiredError extends Error {
  */
 export function parseVerificationRequired(body) {
     let data = body;
-    if (typeof data === 'string') {
+    if (typeof body === 'string') {
         try {
-            data = JSON.parse(data);
+            data = JSON.parse(body);
         }
         catch {
-            if (!/VALIDATION_REQUIRED|verify your account/i.test(data))
+            if (!/VALIDATION_REQUIRED|verify your account/i.test(body))
                 return undefined;
-            const link = /https:\/\/accounts\.google\.com\/[^\s"'<>\\]+/.exec(data);
-            return { message: 'Verify your account to continue.', ...(link ? { verificationUrl: link[0] } : {}) };
+            const link = /https:\/\/[^\s"'<>\\]+/.exec(body);
+            const url = link && isAllowedVerificationUrl(link[0], { excludeSupport: true }) ? link[0] : undefined;
+            return { message: 'Verify your account to continue.', ...(url !== undefined ? { verificationUrl: url } : {}) };
         }
     }
-    const error = data && typeof data === 'object' ? (data.error ?? data) : undefined;
-    const details = Array.isArray(error?.details) ? error.details : [];
-    const info = details.find(d => d && typeof d === 'object' && d.reason === 'VALIDATION_REQUIRED');
+    const record = asRecord(data);
+    const error = asRecord(record?.error) ?? record;
+    const rawDetails = Array.isArray(error?.details) ? error.details : [];
+    const details = rawDetails.map(asRecord).filter((d) => d !== undefined);
+    const info = details.find(d => d.reason === 'VALIDATION_REQUIRED');
     const helpUrl = details
-        .flatMap(d => (Array.isArray(d?.links) ? d.links : []))
-        .map(l => l?.url)
-        .find(u => typeof u === 'string' && /^https:\/\/accounts\.google\.com\//.test(u));
+        .flatMap(d => (Array.isArray(d.links) ? d.links : []))
+        .map(l => asRecord(l)?.url)
+        .find((u) => isAllowedVerificationUrl(u, { excludeSupport: true }));
     if (info === undefined && !/verify your account/i.test(String(error?.message ?? '')))
         return undefined;
-    const url = typeof info?.metadata?.validation_url === 'string' && /^https:\/\//.test(info.metadata.validation_url)
-        ? info.metadata.validation_url
-        : helpUrl;
-    const message = String(info?.metadata?.validation_error_message ?? error?.message ?? 'Verify your account to continue.');
+    const metadata = asRecord(info?.metadata);
+    const validationUrl = metadata?.validation_url;
+    const url = isAllowedVerificationUrl(validationUrl) ? validationUrl : helpUrl;
+    const message = String(metadata?.validation_error_message ?? error?.message ?? 'Verify your account to continue.');
     return { message, ...(url !== undefined ? { verificationUrl: url } : {}) };
 }
 /**
@@ -821,13 +847,22 @@ export async function inspectCloudCodeAccount(options) {
     ]);
     // A verification demand shows up on `retrieveUserQuotaSummary` (and sometimes
     // `loadCodeAssist`) while `fetchAvailableModels` still answers 200, so check
-    // every 403 before deciding the account is fine.
-    for (const res of [loadRes, summaryRes, modelsRes]) {
+    // every 403 before deciding the account is fine. Prefer a response carrying the
+    // verification URL when another 403 omits it.
+    let firstVerification;
+    for (const res of [summaryRes, loadRes, modelsRes]) {
         if (res.status !== 403)
             continue;
         const verification = parseVerificationRequired(res.body);
-        if (verification !== undefined)
+        if (verification === undefined)
+            continue;
+        if (verification.verificationUrl !== undefined) {
             throw new VerificationRequiredError(verification.message, verification.verificationUrl);
+        }
+        firstVerification ??= verification;
+    }
+    if (firstVerification !== undefined) {
+        throw new VerificationRequiredError(firstVerification.message, firstVerification.verificationUrl);
     }
     if (modelsRes.status === 403) {
         throw new Error(`Account forbidden (HTTP 403): ${typeof modelsRes.body === 'string' ? modelsRes.body : JSON.stringify(modelsRes.body)}`);

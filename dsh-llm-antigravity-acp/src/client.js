@@ -381,6 +381,7 @@ window.__ModuleLoader__.load({
       '.dsh-agy-dot{display:inline-block;width:7px;height:7px;border-radius:999px;flex:0 0 auto}',
       '.dsh-agy-badge{display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border-radius:999px;font-size:11px;line-height:18px;font-weight:500;white-space:nowrap;background:var(--dsw-alias-bg-module-platform, color-mix(in srgb, currentColor 6%, transparent));color:var(--dsw-alias-label-primary)}',
       '.dsh-agy-badge-system{padding:1px 7px;font-size:11px;background:color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 12%, transparent);color:var(--dsw-alias-state-business-primary, #4176e6)}',
+      '.dsh-agy-badge-verify{padding:1px 8px;font-size:11px;background:color-mix(in srgb, #e0a800 16%, transparent);color:var(--dsw-alias-state-warning-primary, #b45309)}',
       '.dsh-agy-tier{display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;font-size:11px;line-height:18px;font-weight:500;letter-spacing:0.02em;white-space:nowrap;background:var(--dsw-alias-bg-module-platform, color-mix(in srgb, currentColor 7%, transparent));color:var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary))}',
       '.dsh-agy-tier-ultra{background:color-mix(in srgb, #7c3aed 13%, transparent);color:#7c3aed}',
       '.dsh-agy-tier-pro{background:color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 13%, transparent);color:var(--dsw-alias-state-business-primary, #4176e6)}',
@@ -971,8 +972,11 @@ window.__ModuleLoader__.load({
       const needsVerify = !quotaSaysOk && (row.verificationRequired === true || (!!props.quota && props.quota.verificationRequired === true))
       const verifyUrl = (props.quota && props.quota.verificationUrl) || row.verificationUrl || ''
       const openVerify = () => {
-        if (verifyUrl) window.open(verifyUrl, '_blank', 'noopener,noreferrer')
-        else props.onRefreshQuota()
+        if (verifyUrl && typeof window !== 'undefined' && typeof window.open === 'function') {
+          window.open(verifyUrl, '_blank', 'noopener,noreferrer')
+        } else {
+          props.onRefreshQuota()
+        }
       }
       const removeStyle = { padding: '4px 10px', color: '#d9534f', borderColor: 'color-mix(in srgb, #d9534f 30%, transparent)' }
       // Removing the machine account drops this Mac's own login from the list,
@@ -1024,7 +1028,6 @@ window.__ModuleLoader__.load({
                 needsVerify ? h('span', {
                   className: 'dsh-agy-badge dsh-agy-badge-verify',
                   'data-agy-verify': 'required',
-                  style: { color: '#b45309', background: 'color-mix(in srgb, #f59e0b 16%, transparent)', borderColor: 'color-mix(in srgb, #f59e0b 40%, transparent)' },
                 }, t('Verification required', '需要验证')) : null),
               h('div', { className: 'dsh-agy-account-sub' },
                 (!system && !remarkOf(row) && signedIn(row))
@@ -1065,7 +1068,9 @@ window.__ModuleLoader__.load({
         cooldowns.length > 0 ? h('div', { className: 'dsh-agy-cooldowns' },
           ...cooldowns.map((entry) => h('span', { key: String(entry.family), 'data-agy-cooldown': entry.family },
             t(`${accountFamilyLabel(entry.family)} paused ${cooldownLabel(entry.until)}`, `${accountFamilyLabel(entry.family)} 冷却 ${cooldownLabel(entry.until)}`)))) : null,
-        row.error ? h('div', { role: 'alert', className: 'dsh-agy-account-error' }, row.error) : null,
+        row.error && !(needsVerify && /VALIDATION_REQUIRED|verify your account/i.test(String(row.error)))
+          ? h('div', { role: 'alert', className: 'dsh-agy-account-error' }, row.error)
+          : null,
         needsVerify ? h('div', { role: 'alert', className: 'dsh-agy-ticket', 'data-agy-verify': 'panel' },
           h('div', { className: 'dsh-agy-row-alert' },
             t('Google asks you to verify this account before it can serve again. Finish it in the browser, then recheck.',
